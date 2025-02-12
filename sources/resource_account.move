@@ -45,4 +45,10 @@ module staking_contract::resource_account {
             initialize(deployer);
         }
     }
+
+    #[test_only]
+    /// Check if resource account is initialized
+    public fun is_initialized(): bool {
+        exists<ResourceCap>(@staking_contract)
+    }
 }

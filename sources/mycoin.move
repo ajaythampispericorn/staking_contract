@@ -4,10 +4,11 @@ module staking_contract::mycoin {
     use std::signer;
     use std::option;
     use aptos_framework::coin::{Self, MintCapability, BurnCapability};
-    use aptos_framework::account::{Self, SignerCapability};
+    use aptos_framework::account;
     use aptos_framework::event::{Self, EventHandle};
     use aptos_framework::timestamp;
     use staking_contract::roles;
+    use staking_contract::resource_account;
 
     /// Error codes
     const ENOT_ADMIN: u64 = 1;
@@ -16,7 +17,6 @@ module staking_contract::mycoin {
     const EMAX_SUPPLY_EXCEEDED: u64 = 4;
     const EINVALID_DECIMALS: u64 = 5;
     const EALREADY_REGISTERED: u64 = 6;
-    const ESIGNER_CAP_NOT_FOUND: u64 = 7;
 
     /// Constants
     const MAX_SUPPLY: u64 = 1000000000000000; 
@@ -25,11 +25,6 @@ module staking_contract::mycoin {
 
     /// MyCoin token
     struct MyCoin {}
-
-    /// Resource account capability
-    struct CoinCapability has key {
-        signer_cap: SignerCapability
-    }
 
     /// Storing mint and burn capabilities
     struct Capabilities has key {
@@ -57,12 +52,8 @@ module staking_contract::mycoin {
     }
 
     fun init_module(deployer: &signer) {
-        let (resource_signer, signer_cap) = account::create_resource_account(
-            deployer,
-            b"MYCOIN"
-        );
-
-        move_to(deployer, CoinCapability { signer_cap });
+        let resource_signer = resource_account::get_resource_signer();
+        let resource_addr = resource_account::get_resource_account_address();
 
         let (burn_cap, freeze_cap, mint_cap) = coin::initialize<MyCoin>(
             &resource_signer,
@@ -86,15 +77,17 @@ module staking_contract::mycoin {
     }
     
     #[test_only]
-    public fun init_for_testing(deployer: &signer) {
+public fun init_for_testing(deployer: &signer) {
+    let resource_addr = resource_account::get_resource_account_address();
+    
+    // Only initialize if coin and capabilities don't exist
+    if (!exists<Capabilities>(resource_addr)) {
+        // Initialize resource account if needed
+        resource_account::initialize_for_test(deployer);
+        let resource_signer = resource_account::get_resource_signer();
+
+        // Only initialize coin if it hasn't been initialized
         if (!coin::is_coin_initialized<MyCoin>()) {
-            let (resource_signer, signer_cap) = account::create_resource_account(
-                deployer,
-                b"MYCOIN"
-            );
-
-            move_to(deployer, CoinCapability { signer_cap });
-
             let (burn_cap, freeze_cap, mint_cap) = coin::initialize<MyCoin>(
                 &resource_signer,
                 string::utf8(b"MyCoin"),
@@ -114,30 +107,23 @@ module staking_contract::mycoin {
             });
 
             coin::destroy_freeze_cap(freeze_cap);
-        }
-    }
-
-    fun get_resource_signer(deployer_address: address): signer acquires CoinCapability {
-        assert!(exists<CoinCapability>(deployer_address), error::not_found(ESIGNER_CAP_NOT_FOUND));
-        let signer_cap = &borrow_global<CoinCapability>(deployer_address).signer_cap;
-        account::create_signer_with_capability(signer_cap)
-    }
-
+        };
+    };
+}
     public fun register(account: &signer) {
         coin::register<MyCoin>(account);
     }
 
     public entry fun mint(
-        deployer_address: address,
         admin: &signer,
         amount: u64,
         to: address,
-    ) acquires Capabilities, CoinCapability {
-        let _resource_signer = get_resource_signer(deployer_address);
+    ) acquires Capabilities, CoinEvents {
         roles::assert_admin(admin);
         
-        assert!(exists<Capabilities>(@staking_contract), error::not_found(7));
-        let caps = borrow_global<Capabilities>(@staking_contract);
+        let resource_addr = resource_account::get_resource_account_address();
+        assert!(exists<Capabilities>(resource_addr), error::not_found(7));
+        let caps = borrow_global<Capabilities>(resource_addr);
         
         assert!(amount > 0, error::invalid_argument(EZERO_MINT_AMOUNT));
         assert!(coin::is_account_registered<MyCoin>(to), error::invalid_state(EACCOUNT_NOT_REGISTERED));
@@ -150,19 +136,44 @@ module staking_contract::mycoin {
 
         let coins_minted = coin::mint(amount, &caps.mint_cap);
         coin::deposit(to, coins_minted);
+
+        // Emit mint event
+        let events = borrow_global_mut<CoinEvents>(resource_addr);
+        event::emit_event(
+            &mut events.mint_events,
+            MintEvent {
+                amount,
+                recipient: to,
+                timestamp: timestamp::now_seconds(),
+            }
+        );
     }
 
     public fun burn(
-        deployer_address: address,
         coins: coin::Coin<MyCoin>,
         admin: &signer,
-    ) acquires Capabilities, CoinCapability {
-        let _resource_signer = get_resource_signer(deployer_address);
+    ) acquires Capabilities, CoinEvents {
         roles::assert_admin(admin);
         
-        assert!(exists<Capabilities>(@staking_contract), error::not_found(7));
-        let caps = borrow_global<Capabilities>(@staking_contract);
+        let resource_addr = resource_account::get_resource_account_address();
+        assert!(exists<Capabilities>(resource_addr), error::not_found(7));
+        let caps = borrow_global<Capabilities>(resource_addr);
+        
+        let amount = coin::value(&coins);
+        let burner = signer::address_of(admin);
+        
         coin::burn(coins, &caps.burn_cap);
+
+        // Emit burn event
+        let events = borrow_global_mut<CoinEvents>(resource_addr);
+        event::emit_event(
+            &mut events.burn_events,
+            BurnEvent {
+                amount,
+                burner,
+                timestamp: timestamp::now_seconds(),
+            }
+        );
     }
 
     public fun get_token_info(): (string::String, string::String, u8) {
@@ -190,15 +201,15 @@ module staking_contract::mycoin {
     }
 
     #[test_only]
-    public fun test_mint(deployer: &signer, amount: u64, recipient: address) acquires Capabilities {
-        let caps = borrow_global<Capabilities>(@staking_contract);
+    public fun test_mint(amount: u64, recipient: address) acquires Capabilities {
+        let caps = borrow_global<Capabilities>(resource_account::get_resource_account_address());
         let coins = coin::mint(amount, &caps.mint_cap);
         coin::deposit(recipient, coins);
     }
 
     #[test_only]
     public fun test_burn(coins: coin::Coin<MyCoin>) acquires Capabilities {
-        let caps = borrow_global<Capabilities>(@staking_contract);
+        let caps = borrow_global<Capabilities>(resource_account::get_resource_account_address());
         coin::burn(coins, &caps.burn_cap);
     }
 }

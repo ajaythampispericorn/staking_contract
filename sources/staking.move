@@ -249,6 +249,16 @@ module staking_contract::staking {
         pool.apy_rate = new_apy_rate;
     }
 
+    public fun is_emergency_mode(): bool acquires StakingPool {
+    let resource_account_addr = get_pool_address();
+    borrow_global<StakingPool>(resource_account_addr).emergency_mode
+}
+
+public fun get_apy_rate(): u64 acquires StakingPool {
+    let resource_account_addr = get_pool_address();
+    borrow_global<StakingPool>(resource_account_addr).apy_rate
+}
+
     #[test_only]
     public fun check_pool_initialized(): bool {
         exists<StakingPool>(get_pool_address())

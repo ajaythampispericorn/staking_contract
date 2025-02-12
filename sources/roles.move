@@ -4,8 +4,11 @@ module staking_contract::roles {
     use std::string;
     use std::vector;
     use aptos_framework::event::{Self, EventHandle};
-    use aptos_framework::account::{Self, SignerCapability};
+    use aptos_framework::account;
     use aptos_framework::timestamp;
+    use aptos_framework::coin;  // Add coin module import
+    use staking_contract::resource_account;
+    use staking_contract::mycoin::MyCoin;
 
     /// Error codes
     const ENOT_ADMIN: u64 = 1;
@@ -13,16 +16,10 @@ module staking_contract::roles {
     const EROLE_ALREADY_ASSIGNED: u64 = 3;
     const EINVALID_ROLE: u64 = 4;
     const ESELF_REVOKE: u64 = 5;
-    const ESIGNER_CAP_NOT_FOUND: u64 = 6;
 
     /// Role types
     const ROLE_ADMIN: u8 = 1;
     const ROLE_STAKER: u8 = 2;
-
-    /// Resource account capability
-    struct RoleCapability has key {
-        signer_cap: SignerCapability
-    }
 
     /// Role events
     struct RoleGrantEvent has drop, store {
@@ -40,70 +37,34 @@ module staking_contract::roles {
     }
 
     /// Stores role information with multi-role support
-    struct UserRoles has key {
-        roles: vector<u8>
-    }
-
-    /// Event handles
-    struct RoleEvents has key {
+    struct Roles has key {
+        user_roles: vector<UserRole>,
         grant_events: EventHandle<RoleGrantEvent>,
         revoke_events: EventHandle<RoleRevokeEvent>,
     }
 
-    fun get_resource_signer(deployer_address: address): signer acquires RoleCapability {
-        assert!(exists<RoleCapability>(deployer_address), error::not_found(ESIGNER_CAP_NOT_FOUND));
-        let signer_cap = &borrow_global<RoleCapability>(deployer_address).signer_cap;
-        account::create_signer_with_capability(signer_cap)
+    struct UserRole has store {
+        account: address,
+        roles: vector<u8>
     }
 
     /// Initialize roles with event handling
-    public fun initialize(deployer: &signer) {
-        let (resource_signer, signer_cap) = account::create_resource_account(
-            deployer,
-            b"ROLES"
-        );
+    public fun initialize(deployer: &signer) acquires Roles {  // Added 'acquires Roles'
+    let resource_signer = resource_account::get_resource_signer();
+    let resource_addr = resource_account::get_resource_account_address();
+    
+    assert!(!exists<Roles>(resource_addr), 0);
 
-        move_to(deployer, RoleCapability { signer_cap });
-        
-        let roles = vector::empty<u8>();
-        vector::push_back(&mut roles, ROLE_ADMIN);
-        move_to(&resource_signer, UserRoles { roles });
+    move_to(&resource_signer, Roles {
+        user_roles: vector::empty(),
+        grant_events: account::new_event_handle<RoleGrantEvent>(&resource_signer),
+        revoke_events: account::new_event_handle<RoleRevokeEvent>(&resource_signer),
+    });
 
-        move_to(&resource_signer, RoleEvents {
-            grant_events: account::new_event_handle<RoleGrantEvent>(&resource_signer),
-            revoke_events: account::new_event_handle<RoleRevokeEvent>(&resource_signer),
-        });
-    }
-
-    #[test_only]
-    public fun initialize_for_test(deployer: &signer, admin: &signer, _user: &signer) {
-        if (!exists<RoleEvents>(@staking_contract)) {
-            let (resource_signer, signer_cap) = account::create_resource_account(
-                deployer,
-                b"ROLES"
-            );
-
-            move_to(deployer, RoleCapability { signer_cap });
-
-            // Initialize admin role
-            let roles = vector::empty<u8>();
-            vector::push_back(&mut roles, ROLE_ADMIN);
-            move_to(&resource_signer, UserRoles { roles });
-
-            // Initialize event handles
-            move_to(&resource_signer, RoleEvents {
-                grant_events: account::new_event_handle<RoleGrantEvent>(&resource_signer),
-                revoke_events: account::new_event_handle<RoleRevokeEvent>(&resource_signer),
-            });
-
-            // Setup admin role for the admin account
-            if (!exists<UserRoles>(signer::address_of(admin))) {
-                move_to(admin, UserRoles { 
-                    roles: vector::singleton(ROLE_ADMIN) 
-                });
-            };
-        }
-    }
+    // Initialize deployer as admin
+    let deployer_addr = signer::address_of(deployer);
+    internal_assign_role(deployer_addr, ROLE_ADMIN, deployer_addr);
+}
 
     fun validate_role(role: u8) {
         assert!(
@@ -112,87 +73,108 @@ module staking_contract::roles {
         );
     }
 
-    public entry fun assign_role(
-        deployer_address: address,
-        admin: &signer,
-        account_addr: address,
-        role: u8,
-    ) acquires UserRoles, RoleEvents, RoleCapability {
-        let resource_signer = get_resource_signer(deployer_address);
-        let admin_addr = signer::address_of(admin);
-        assert!(is_admin(admin_addr), error::permission_denied(ENOT_ADMIN));
-        validate_role(role);
+    fun find_user_role_index(roles: &vector<UserRole>, account: address): (bool, u64) {
+        let i = 0;
+        let len = vector::length(roles);
+        while (i < len) {
+            if (vector::borrow(roles, i).account == account) {
+                return (true, i)
+            };
+            i = i + 1;
+        };
+        (false, 0)
+    }
 
-        assert!(account::exists_at(account_addr), error::not_found(EROLE_NOT_FOUND));
+    fun internal_assign_role(account: address, role: u8, admin_addr: address) acquires Roles {
+        validate_role(role);
         
-        if (!exists<UserRoles>(account_addr)) {
-            move_to(&resource_signer, UserRoles { 
-                roles: vector::empty() 
-            });
+        let roles = borrow_global_mut<Roles>(resource_account::get_resource_account_address());
+        let (exists, index) = find_user_role_index(&roles.user_roles, account);
+        
+        if (!exists) {
+            let new_user_role = UserRole {
+                account,
+                roles: vector::singleton(role)
+            };
+            vector::push_back(&mut roles.user_roles, new_user_role);
+        } else {
+            let user_role = vector::borrow_mut(&mut roles.user_roles, index);
+            assert!(!vector::contains(&user_role.roles, &role), error::already_exists(EROLE_ALREADY_ASSIGNED));
+            vector::push_back(&mut user_role.roles, role);
         };
 
-        let user_roles = borrow_global_mut<UserRoles>(account_addr);
-        assert!(
-            !vector::contains(&user_roles.roles, &role),
-            error::already_exists(EROLE_ALREADY_ASSIGNED)
-        );
-        vector::push_back(&mut user_roles.roles, role);
-
-        // Emit role grant event
-        let events = borrow_global_mut<RoleEvents>(@staking_contract);
-        event::emit_event(&mut events.grant_events, RoleGrantEvent {
+        event::emit_event(&mut roles.grant_events, RoleGrantEvent {
             role,
-            account: account_addr,
+            account,
             granted_by: admin_addr,
             timestamp: timestamp::now_seconds(),
         });
     }
 
-    public fun has_role(account: address, role: u8): bool acquires UserRoles {
-        if (!exists<UserRoles>(account)) {
-            return false
-        };
-        let user_roles = borrow_global<UserRoles>(account);
-        vector::contains(&user_roles.roles, &role)
+    public entry fun assign_role(
+        admin: &signer,
+        account: address,
+        role: u8,
+    ) acquires Roles {
+        let admin_addr = signer::address_of(admin);
+        assert!(is_admin(admin_addr), error::permission_denied(ENOT_ADMIN));
+        internal_assign_role(account, role, admin_addr);
     }
 
-    public fun is_admin(addr: address): bool acquires UserRoles {
+    public fun has_role(account: address, role: u8): bool acquires Roles {
+        let roles = borrow_global<Roles>(resource_account::get_resource_account_address());
+        let (exists, index) = find_user_role_index(&roles.user_roles, account);
+        if (!exists) {
+            return false
+        };
+        let user_role = vector::borrow(&roles.user_roles, index);
+        vector::contains(&user_role.roles, &role)
+    }
+
+    public fun is_admin(addr: address): bool acquires Roles {
         has_role(addr, ROLE_ADMIN)
     }
 
-    public fun is_staker(addr: address): bool acquires UserRoles {
+    public fun is_staker(addr: address): bool acquires Roles {
         has_role(addr, ROLE_STAKER)
     }
 
-    public fun assert_admin(admin: &signer) acquires UserRoles {
+    public fun assert_admin(admin: &signer) acquires Roles {
         assert!(
             is_admin(signer::address_of(admin)),
             error::permission_denied(ENOT_ADMIN)
         );
     }
 
-    public fun get_user_roles(account: address): vector<u8> acquires UserRoles {
-        if (!exists<UserRoles>(account)) {
+    public fun get_user_roles(account: address): vector<u8> acquires Roles {
+        let roles = borrow_global<Roles>(resource_account::get_resource_account_address());
+        let (exists, index) = find_user_role_index(&roles.user_roles, account);
+        if (!exists) {
             vector::empty()
         } else {
-            *&borrow_global<UserRoles>(account).roles
+            *&vector::borrow(&roles.user_roles, index).roles
         }
     }
 
     #[test_only]
-    public fun create_user_roles(): UserRoles {
-        UserRoles {
-            roles: vector::empty()
-        }
-    }
-
-    #[test_only]
-    public fun init_for_testing(deployer: &signer) {
+public fun initialize_for_test(deployer: &signer, admin: &signer, _user: &signer) acquires Roles {
+    if (!exists<Roles>(resource_account::get_resource_account_address())) {
+        resource_account::initialize_for_test(deployer);
         initialize(deployer);
+        
+        // Setup additional admin role if needed
+        if (signer::address_of(admin) != signer::address_of(deployer)) {
+            internal_assign_role(
+                signer::address_of(admin),
+                ROLE_ADMIN,
+                signer::address_of(deployer)
+            );
+        };
     }
+}
 
     #[test_only]
     public fun check_roles_initialized(): bool {
-        exists<RoleEvents>(@staking_contract)
+        exists<Roles>(resource_account::get_resource_account_address())
     }
 }
