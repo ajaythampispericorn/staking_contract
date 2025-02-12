@@ -1,0 +1,20 @@
+[package]
+name = "staking_contract"
+version = "1.0.0"
+authors = []
+
+[addresses]
+staking_contract = "0xcc68a642cfc8b7119d208e07d397a04fa716c7ffc523a3506c475036ce35f036"
+aptos_framework = "0x1"
+
+[networks]
+testnet = { rpc = "https://fullnode.testnet.aptoslabs.com/v1" }
+
+[dev-addresses]
+
+[dependencies.AptosFramework]
+git = "https://github.com/aptos-labs/aptos-core.git"
+rev = "testnet"
+subdir = "aptos-move/framework/aptos-framework/"
+
+[dev-dependencies]
